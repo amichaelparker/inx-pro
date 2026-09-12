@@ -6,6 +6,7 @@
 #include <BatteryMonitor.h>
 #include <BoardConfig.h>
 #include <HalGPIO.h>
+#include <Preferences.h>
 #include <Rtc.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
@@ -23,6 +24,35 @@ uint8_t weekdayFromCalendarDate(const uint16_t year, const uint8_t month, const 
   const uint8_t sundayZero = static_cast<uint8_t>(
       (adjustedYear + adjustedYear / 4 - adjustedYear / 100 + adjustedYear / 400 + monthOffsets[month - 1] + day) % 7);
   return static_cast<uint8_t>(sundayZero == 0 ? 7 : sundayZero);
+}
+
+// "The device is deliberately asleep." Persisted in NVS because RTC memory is lost on
+// exactly the resets this must survive: the charger's power-path switching power-cycles
+// the S3 (cable plug/unplug, and the top-off recharge cycle a full battery repeats every
+// few minutes on a charger), and each of those must boot straight back into deep sleep.
+// The only wake that clears it is a genuine power-button EXT1 wake (plus the esptool
+// flash carve-out in getWakeupReason). NVS skips writes of unchanged values, so the
+// repeated set-while-sleeping cycles cost no flash wear.
+constexpr char kPowerPrefsNamespace[] = "inx-power";
+constexpr char kSleepIntentKey[] = "sleeping";
+
+bool readSleepIntent() {
+  Preferences prefs;
+  if (!prefs.begin(kPowerPrefsNamespace, /*readOnly=*/true)) {
+    return false;  // namespace doesn't exist yet: never slept -> no intent
+  }
+  const bool intent = prefs.getBool(kSleepIntentKey, false);
+  prefs.end();
+  return intent;
+}
+
+void writeSleepIntent(const bool intent) {
+  Preferences prefs;
+  if (!prefs.begin(kPowerPrefsNamespace, /*readOnly=*/false)) {
+    return;
+  }
+  prefs.putBool(kSleepIntentKey, intent);
+  prefs.end();
 }
 
 }
@@ -169,6 +199,7 @@ HalGPIO::MotionGesture HalGPIO::readMotionGesture(const uint8_t orientation, con
 }
 
 void HalGPIO::startDeepSleep() {
+  writeSleepIntent(true);
   const auto& in = BoardConfig::ACTIVE.input;
   const bool pressedLevel = in.powerActiveHigh ? HIGH : LOW;
   while (digitalRead(in.power) == pressedLevel) {
@@ -204,26 +235,14 @@ bool HalGPIO::isUsbConnected() const {
   if (BoardConfig::ACTIVE.usbDetect >= 0) {
     return digitalRead(BoardConfig::ACTIVE.usbDetect) == HIGH;
   }
-  // No dedicated VBUS-detect GPIO exists on this board: a pull-diff sweep of every
-  // unclaimed pin (src/probe/pinprobe_main.cpp) found nothing that tracks the cable
-  // except the charger STAT line (GPIO21, active-high), which flips with plug/unplug.
-  // STAT means "charging", not "VBUS present" - it can drop once the battery is full -
-  // so HWCDC covers the data-host case in that window. A full battery on a dumb wall
-  // charger is the one combination that still reads disconnected.
-  if (HWCDC::isPlugged()) {
-    return true;
-  }
-  const int statPin = BoardConfig::ACTIVE.batteryChargeStatus;
-  if (statPin < 0) {
-    return false;
-  }
-  static bool statConfigured = false;
-  if (!statConfigured) {
-    pinMode(statPin, INPUT);
-    statConfigured = true;
-  }
-  const bool statHigh = digitalRead(statPin) == HIGH;
-  return BoardConfig::ACTIVE.batteryChargeStatusActiveHigh ? statHigh : !statHigh;
+  // No dedicated VBUS-detect GPIO exists on this board (a pull-diff sweep of every
+  // unclaimed pin - src/probe/pinprobe_main.cpp - found nothing that tracks the cable),
+  // so this reports data hosts only. Deliberately NOT the GPIO21 charge-STAT line:
+  // "charging" is racy at charge-state edges (it drops at termination and cycles during
+  // top-off), and the sleep/wake classification no longer needs it - getWakeupReason()
+  // uses the persisted sleep-intent flag instead. Callers of this method (the boot
+  // serial-console wait) genuinely want "is a computer attached".
+  return HWCDC::isPlugged();
 }
 
 bool HalGPIO::readDateTime(DateTime& outDateTime) const {
@@ -283,28 +302,43 @@ bool HalGPIO::syncRtcFromSystemTime() const {
 }
 
 HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
+  // Computed once and cached: classification has a side effect (clearing the persisted
+  // sleep intent), and every caller in one boot must see the same answer.
+  static bool computed = false;
+  static WakeupReason cached = WakeupReason::Other;
+  if (computed) {
+    return cached;
+  }
+  computed = true;
+
   const auto wakeupCause = esp_sleep_get_wakeup_cause();
   const auto resetReason = esp_reset_reason();
-  const bool usbConnected = isUsbConnected();
 
   if (resetReason == ESP_RST_DEEPSLEEP &&
       (wakeupCause == ESP_SLEEP_WAKEUP_GPIO || wakeupCause == ESP_SLEEP_WAKEUP_EXT1)) {
-    return WakeupReason::PowerButton;
+    // The one legitimate wake: the power button EXT1 line. The device is awake on purpose.
+    writeSleepIntent(false);
+    cached = WakeupReason::PowerButton;
+  } else if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && HWCDC::isPlugged()) {
+    // esptool's in-band USB reset after flashing reads as UNKNOWN with a data host
+    // attached. Boot normally even if the device was asleep when flashing started.
+    writeSleepIntent(false);
+    cached = WakeupReason::AfterFlash;
+  } else if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && readSleepIntent()) {
+    // The device was deliberately asleep and this boot is NOT the power button: the
+    // charger's power-path switching power-cycled the S3 (cable plug/unplug, or the
+    // top-off recharge cycle a full battery repeats every few minutes on a charger).
+    // Classify for straight return to deep sleep, whatever the reset reason says -
+    // these glitch resets show up as POWERON, UNKNOWN, or BROWNOUT depending on how
+    // deep the rail dipped, and none of them were asked for by the user.
+    cached = WakeupReason::AfterUSBPower;
+  } else {
+    // Cold boot with no sleep intent on record (first boot, battery insertion, restart
+    // chord, crash while awake) - boot normally.
+    writeSleepIntent(false);
+    cached = WakeupReason::Other;
   }
-  // !usbConnected matters (and mirrors the Sticky HAL): without it this branch
-  // shadows AfterUSBPower below, which also matches POWERON - plugging the charger
-  // into a sleeping unit power-cycles the S3, and that boot must be classified as
-  // AfterUSBPower so setup() can put the device straight back to deep sleep.
-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected) {
-    return WakeupReason::Other;
-  }
-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && usbConnected) {
-    return WakeupReason::AfterFlash;
-  }
-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && usbConnected) {
-    return WakeupReason::AfterUSBPower;
-  }
-  return WakeupReason::Other;
+  return cached;
 }
 
 bool HalGPIO::getTemperatureAndHumidity(float& outTempC, float& outHumidityPct) const {
