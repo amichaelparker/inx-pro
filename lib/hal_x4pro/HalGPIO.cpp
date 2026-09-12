@@ -201,10 +201,29 @@ bool HalGPIO::isCharging() const {
 }
 
 bool HalGPIO::isUsbConnected() const {
-  if (BoardConfig::ACTIVE.usbDetect < 0) {
+  if (BoardConfig::ACTIVE.usbDetect >= 0) {
+    return digitalRead(BoardConfig::ACTIVE.usbDetect) == HIGH;
+  }
+  // No dedicated VBUS-detect GPIO exists on this board: a pull-diff sweep of every
+  // unclaimed pin (src/probe/pinprobe_main.cpp) found nothing that tracks the cable
+  // except the charger STAT line (GPIO21, active-high), which flips with plug/unplug.
+  // STAT means "charging", not "VBUS present" - it can drop once the battery is full -
+  // so HWCDC covers the data-host case in that window. A full battery on a dumb wall
+  // charger is the one combination that still reads disconnected.
+  if (HWCDC::isPlugged()) {
+    return true;
+  }
+  const int statPin = BoardConfig::ACTIVE.batteryChargeStatus;
+  if (statPin < 0) {
     return false;
   }
-  return digitalRead(BoardConfig::ACTIVE.usbDetect) == HIGH;
+  static bool statConfigured = false;
+  if (!statConfigured) {
+    pinMode(statPin, INPUT);
+    statConfigured = true;
+  }
+  const bool statHigh = digitalRead(statPin) == HIGH;
+  return BoardConfig::ACTIVE.batteryChargeStatusActiveHigh ? statHigh : !statHigh;
 }
 
 bool HalGPIO::readDateTime(DateTime& outDateTime) const {
@@ -272,7 +291,11 @@ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
       (wakeupCause == ESP_SLEEP_WAKEUP_GPIO || wakeupCause == ESP_SLEEP_WAKEUP_EXT1)) {
     return WakeupReason::PowerButton;
   }
-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON) {
+  // !usbConnected matters (and mirrors the Sticky HAL): without it this branch
+  // shadows AfterUSBPower below, which also matches POWERON - plugging the charger
+  // into a sleeping unit power-cycles the S3, and that boot must be classified as
+  // AfterUSBPower so setup() can put the device straight back to deep sleep.
+  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected) {
     return WakeupReason::Other;
   }
   if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && usbConnected) {
