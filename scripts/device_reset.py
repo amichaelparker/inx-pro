@@ -25,7 +25,7 @@ Import("env")
 # USB — so that does nothing and esptool reports "No serial data received". `usb-reset` is
 # the in-band sequence for native USB and is what this board needs.
 def _resetMode(env):
-    return "usb-reset" if env["PIOENV"] == "x4pro" else "default-reset"
+    return "usb-reset" if env["PIOENV"].startswith("x4pro") else "default-reset"
 
 
 def _esptool(env, args, label):
