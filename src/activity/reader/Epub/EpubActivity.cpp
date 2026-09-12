@@ -218,6 +218,13 @@ void EpubActivity::handleChapterLoadFailure() {
   onGoBack();
 }
 
+namespace {
+/** Inflated bytes pumped per incremental-build step. The foreground pump favors throughput;
+ *  the idle prefetch favors short steps so a page turn is never far behind one slice. */
+constexpr size_t kForegroundBuildStepBytes = 24 * 1024;
+constexpr size_t kPrefetchStepBytes = 8 * 1024;
+}
+
 ScreenComponents::LoadingProgressLayout EpubActivity::loadingProgressShow(const char* message,
                                                                           const int progressPercent0to100) {
   renderer.syncWriteBufferFromActive();
@@ -240,53 +247,240 @@ bool EpubActivity::buildSection(int spineIndex, const ViewportInfo& info, bool s
     return false;
   }
   const std::string cachePath = epub->getCachePath();
-  const std::string sectionBinPath = cachePath + "/sections/" + std::to_string(spineIndex) + ".bin";
   const std::string legacySecPath = cachePath + "/" + std::to_string(spineIndex) + ".sec";
   if (SdMan.exists(legacySecPath.c_str())) {
     SdMan.remove(legacySecPath.c_str());
   }
-  if (SdMan.exists(sectionBinPath.c_str())) {
-    SdMan.remove(sectionBinPath.c_str());
+
+  const uint32_t signature = layoutParamsSignature(info);
+
+  // A boundary crossing can land while the idle prefetch is mid-build on this very spine.
+  // Adopt that build - its partial work carries over and finishes here in the foreground.
+  std::unique_ptr<Section> building;
+  if (prefetchSection_ && prefetchSpineIndex_ == spineIndex && prefetchSignature_ == signature &&
+      prefetchSection_->incrementalBuildStatus() == Section::IncrementalBuildStatus::Building) {
+    INX_SERIAL.printf("[%lu] [EPA] buildSection: adopting prefetch spine=%d bytes=%u/%u\n", millis(), spineIndex,
+                      static_cast<unsigned>(prefetchSection_->incrementalBytesParsed()),
+                      static_cast<unsigned>(prefetchSection_->incrementalTotalBytes()));
+    building = std::move(prefetchSection_);
+    prefetchSpineIndex_ = -1;
+  } else {
+    resetChapterPrefetch();  // never two incremental builds (and their temp files) in flight at once
+    std::shared_ptr<Epub> sharedEpub = std::shared_ptr<Epub>(epub.get(), [](Epub*) {});
+    building = std::unique_ptr<Section>(new Section(sharedEpub, spineIndex, renderer));
+    if (!building->beginIncrementalBuild(
+            info.fontId, FontManager::getNextFont(info.fontId), FontManager::getMaxFontId(info.fontId),
+            info.lineCompression, info.wordSpacing, bookSettings.extraParagraphSpacing,
+            bookSettings.paragraphAlignment, info.width, info.height, bookSettings.hyphenationEnabled,
+            bookSettings.paragraphCssIndentEnabled != 0, bookSettings.bionicReadingEnabled != 0, skipImages,
+            [this](Page& page, uint16_t pageIndex) { onSectionPageBuilt(page, pageIndex); })) {
+      return false;
+    }
   }
 
-  std::shared_ptr<Epub> sharedEpub = std::shared_ptr<Epub>(epub.get(), [](Epub*) {});
-  auto tempSection = std::unique_ptr<Section>(new Section(sharedEpub, spineIndex, renderer));
+  // Landing on page 0 (forward crossing, TOC jump): push the first page to the panel the
+  // moment it's laid out, so reading starts while the rest of the chapter still builds.
+  // Mid-chapter and last-page landings need the full page count first. statusBar gates out
+  // the initial-open paths (fastPath/slowPath), whose own loading screens would fight it.
+  earlyRenderArmed_ = statusBar != nullptr && nextPageNumber == 0 && !pendingPercentJump;
+  earlyRenderedThisBuild_ = false;
 
   ScreenComponents::PopupLayout chapterLoadPopup{};
-  const bool useChapterLoadBar = showProgress;
-  if (useChapterLoadBar) {
+  bool popupVisible = false;
+  if (showProgress) {
     renderer.syncWriteBufferFromActive();
     chapterLoadPopup = ScreenComponents::drawPopup(renderer, "Loading chapter...");
-    ScreenComponents::fillPopupProgress(renderer, chapterLoadPopup, 12);
+    popupVisible = true;
   }
 
-  bool success = tempSection->createSectionFile(
-      info.fontId, FontManager::getNextFont(info.fontId), FontManager::getMaxFontId(info.fontId), info.lineCompression,
-      info.wordSpacing, bookSettings.extraParagraphSpacing, bookSettings.paragraphAlignment, info.width, info.height,
-      bookSettings.hyphenationEnabled, bookSettings.paragraphCssIndentEnabled != 0,
-      bookSettings.bionicReadingEnabled != 0, nullptr, skipImages, nullptr,
-      /*warmImageDisplayCache=*/false,
-      /*warmImageRenderMode=*/READER_SETTINGS.readerImageGrayscale != 0 ? ImageRenderMode::TwoBit
-                                                                           : ImageRenderMode::OneBit,
-      /*warmImageQuality=*/READER_SETTINGS.readerImageGrayscale == SystemSetting::READER_IMAGE_HIGH,
-      info.totalMarginTop);
+  int lastShownPercent = 0;
+  auto status = Section::IncrementalBuildStatus::Building;
+  while (status == Section::IncrementalBuildStatus::Building) {
+    status = building->stepIncrementalBuild(kForegroundBuildStepBytes);
+    if (popupVisible && earlyRenderedThisBuild_) {
+      popupVisible = false;  // the early-rendered page replaced the popup on screen
+    }
+    if (popupVisible && status == Section::IncrementalBuildStatus::Building) {
+      const size_t total = building->incrementalTotalBytes();
+      const int percent =
+          total == 0 ? 0
+                     : static_cast<int>(std::min<uint64_t>(
+                           99, (static_cast<uint64_t>(building->incrementalBytesParsed()) * 100) / total));
+      // Async refresh so the panel wave overlaps parsing instead of stalling it.
+      if (percent >= lastShownPercent + 4 && !renderer.isRefreshBusy()) {
+        renderer.syncWriteBufferFromActive();
+        ScreenComponents::PopupLayout const& layout = chapterLoadPopup;
+        constexpr int barHeight = 4;
+        const int barWidth = layout.width - 30;
+        const int barX = layout.x + (layout.width - barWidth) / 2;
+        const int barY = layout.y + layout.height - 10;
+        renderer.rectangle.fill(barX, barY, barWidth * percent / 100, barHeight, true);
+        renderer.displayBufferAsync();
+        lastShownPercent = percent;
+      }
+    }
+    yield();
+  }
+  earlyRenderArmed_ = false;
 
-  if (success) {
-    EpubAnnotations::migrateSpineAnnotations(cachePath, spineIndex, tempSection->pageCount, renderer, info.fontId,
-                                             FontManager::getNextFont(info.fontId), info.totalMarginLeft,
-                                             info.totalMarginTop);
-    annUi_.annotations().clearSession();
-    annUi_.storedRanges().clear();
-    annUi_.clearWordIndexCache();
+  if (status != Section::IncrementalBuildStatus::Ready) {
+    INX_SERIAL.printf("[%lu] [EPA] buildSection: incremental build failed spine=%d\n", millis(), spineIndex);
+    return false;
   }
 
-  if (useChapterLoadBar) {
+  EpubAnnotations::migrateSpineAnnotations(cachePath, spineIndex, building->pageCount, renderer, info.fontId,
+                                           FontManager::getNextFont(info.fontId), info.totalMarginLeft,
+                                           info.totalMarginTop);
+  annUi_.annotations().clearSession();
+  annUi_.storedRanges().clear();
+  annUi_.clearWordIndexCache();
+
+  if (popupVisible) {
     ScreenComponents::fillPopupProgress(renderer, chapterLoadPopup, 100);
     renderer.clearScreen();
     renderer.displayBuffer();
   }
 
-  return success;
+  return true;
+}
+
+uint32_t EpubActivity::layoutParamsSignature(const ViewportInfo& info) const {
+  // Hashes exactly the tuple Section::loadSectionFile() verifies, so a signature match
+  // means an in-flight build will still be accepted by the load that follows it.
+  auto mix = [](uint32_t h, const uint32_t v) { return (h ^ v) * 16777619u; };
+  uint32_t h = 2166136261u;
+  h = mix(h, static_cast<uint32_t>(info.fontId));
+  h = mix(h, static_cast<uint32_t>(info.lineCompression * 1000.0f));
+  h = mix(h, static_cast<uint32_t>(info.wordSpacing * 1000.0f));
+  h = mix(h, bookSettings.extraParagraphSpacing ? 1u : 0u);
+  h = mix(h, static_cast<uint32_t>(bookSettings.paragraphAlignment));
+  h = mix(h, info.width);
+  h = mix(h, info.height);
+  h = mix(h, bookSettings.hyphenationEnabled ? 1u : 0u);
+  h = mix(h, bookSettings.paragraphCssIndentEnabled != 0 ? 1u : 0u);
+  h = mix(h, bookSettings.bionicReadingEnabled != 0 ? 1u : 0u);
+  return h;
+}
+
+void EpubActivity::onSectionPageBuilt(Page& page, const uint16_t pageIndex) {
+  if (!earlyRenderArmed_ || earlyRenderedThisBuild_ || pageIndex != 0) {
+    return;
+  }
+  earlyRenderedThisBuild_ = true;
+
+  if (epub) {
+    page.bindEpub(std::shared_ptr<Epub>(epub.get(), [](Epub*) {}));
+  }
+  const ViewportInfo info = calculateViewport();
+  const int fontId = bookSettings.getReaderFontId();
+  const int headerFontId = FontManager::getNextFont(fontId);
+  const bool twoBit = READER_SETTINGS.readerImageGrayscale != 0 && page.hasImages();
+  renderer.clearScreen(0xFF);
+  page.render(renderer, fontId, headerFontId, info.totalMarginLeft, info.totalMarginTop, /*skipImages=*/false,
+              twoBit ? ImageRenderMode::TwoBit : ImageRenderMode::OneBit, /*skipOnlyGrayscaleImages=*/false);
+  renderer.displayBufferAsync();
+  INX_SERIAL.printf("[%lu] [EPA] early-rendered first page while chapter build continues\n", millis());
+}
+
+void EpubActivity::resetChapterPrefetch() {
+  if (prefetchSection_) {
+    INX_SERIAL.printf("[%lu] [EPA-PREFETCH] cancel spine=%d\n", millis(), prefetchSpineIndex_);
+    prefetchSection_->cancelIncrementalBuild();
+    prefetchSection_.reset();
+  }
+  prefetchSpineIndex_ = -1;
+}
+
+void EpubActivity::runIdleChapterPrefetch() {
+  if (!epub || !section || subActivity || settingsDrawerVisible || updateRequired) {
+    return;
+  }
+  if (navigation_ && navigation_->isTocOpen()) {
+    return;
+  }
+  // Within-chapter page prep goes first, so forward turns keep presenting instantly.
+  if (canPrepareForwardPage() && !preparedPage_.ready) {
+    return;
+  }
+  // A build slice can cost a few hundred ms (more if it hits an image), so wait for a
+  // quiet second after the last page turn before pumping - rapid flipping stays snappy.
+  if (lastAutoPageTurnTime != 0 && millis() - lastAutoPageTurnTime < 1000) {
+    return;
+  }
+
+  const int target = currentSpineIndex + 1;
+  if (prefetchSection_ && prefetchSpineIndex_ != target) {
+    resetChapterPrefetch();
+  }
+  if (target >= epub->getSpineItemsCount()) {
+    return;
+  }
+
+  const ViewportInfo info = calculateViewport();
+  const uint32_t signature = layoutParamsSignature(info);
+  if (prefetchSection_ && prefetchSignature_ != signature) {
+    resetChapterPrefetch();
+  }
+
+  if (prefetchSection_) {
+    const auto status = prefetchSection_->stepIncrementalBuild(kPrefetchStepBytes);
+    if (status == Section::IncrementalBuildStatus::Building) {
+      return;
+    }
+    if (status == Section::IncrementalBuildStatus::Ready) {
+      EpubAnnotations::migrateSpineAnnotations(epub->getCachePath(), prefetchSpineIndex_, prefetchSection_->pageCount,
+                                               renderer, info.fontId, FontManager::getNextFont(info.fontId),
+                                               info.totalMarginLeft, info.totalMarginTop);
+      annUi_.annotations().clearSession();
+      annUi_.storedRanges().clear();
+      annUi_.clearWordIndexCache();
+      INX_SERIAL.printf("[%lu] [EPA-PREFETCH] ready spine=%d pages=%u\n", millis(), prefetchSpineIndex_,
+                        static_cast<unsigned>(prefetchSection_->pageCount));
+    } else {
+      INX_SERIAL.printf("[%lu] [EPA-PREFETCH] failed spine=%d\n", millis(), prefetchSpineIndex_);
+    }
+    // Built or failed - either way this target is settled until the spine or layout changes.
+    prefetchSkipSpine_ = prefetchSpineIndex_;
+    prefetchSkipSig_ = signature;
+    prefetchSection_.reset();
+    prefetchSpineIndex_ = -1;
+    return;
+  }
+
+  if (prefetchSkipSpine_ == target && prefetchSkipSig_ == signature) {
+    return;
+  }
+
+  std::shared_ptr<Epub> sharedEpub = std::shared_ptr<Epub>(epub.get(), [](Epub*) {});
+  {
+    // Already cached with a matching layout? (A stale mismatched file is deleted by this
+    // probe's settings check - the build would have replaced it anyway.)
+    Section probe(sharedEpub, target, renderer);
+    if (probe.loadSectionFile(info.fontId, info.lineCompression, info.wordSpacing, bookSettings.extraParagraphSpacing,
+                              bookSettings.paragraphAlignment, info.width, info.height,
+                              bookSettings.hyphenationEnabled, bookSettings.paragraphCssIndentEnabled != 0,
+                              bookSettings.bionicReadingEnabled != 0)) {
+      prefetchSkipSpine_ = target;
+      prefetchSkipSig_ = signature;
+      return;
+    }
+  }
+
+  auto candidate = std::unique_ptr<Section>(new Section(sharedEpub, target, renderer));
+  const bool started = candidate->beginIncrementalBuild(
+      info.fontId, FontManager::getNextFont(info.fontId), FontManager::getMaxFontId(info.fontId), info.lineCompression,
+      info.wordSpacing, bookSettings.extraParagraphSpacing, bookSettings.paragraphAlignment, info.width, info.height,
+      bookSettings.hyphenationEnabled, bookSettings.paragraphCssIndentEnabled != 0,
+      bookSettings.bionicReadingEnabled != 0, /*skipImages=*/false,
+      [this](Page& page, uint16_t pageIndex) { onSectionPageBuilt(page, pageIndex); });
+  if (!started) {
+    prefetchSkipSpine_ = target;
+    prefetchSkipSig_ = signature;
+    return;
+  }
+  prefetchSection_ = std::move(candidate);
+  prefetchSpineIndex_ = target;
+  prefetchSignature_ = signature;
 }
 
 /**
@@ -995,6 +1189,7 @@ void EpubActivity::onExit() {
     APP_STATE.lastRead = epub->getPath();
   }
   APP_STATE.saveToFile();
+  resetChapterPrefetch();  // before epub.reset(): the build's ItemStream references the Epub
   section.reset();
   bookProgress.reset();
   statusBar.reset();
@@ -1272,6 +1467,7 @@ void EpubActivity::loop() {
 
   runIdlePreparedPage();
   runIdleSecondNextPage();
+  runIdleChapterPrefetch();
 }
 
 /**

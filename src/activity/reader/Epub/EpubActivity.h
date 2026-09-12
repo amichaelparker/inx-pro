@@ -146,6 +146,19 @@ class EpubActivity final : public ActivityWithSubactivity {
   int preloadedPageSpineIndex_ = -1;
   int preloadedPageIndex_ = -1;
 
+  /** Next-chapter background build, pumped from the idle loop tail (see runIdleChapterPrefetch).
+   *  Declared after `epub`: Section's parser/stream reference the Epub, so it must destroy first. */
+  std::unique_ptr<Section> prefetchSection_;
+  int prefetchSpineIndex_ = -1;
+  /** layoutParamsSignature() at begin time; a mismatch on any later tick cancels the build. */
+  uint32_t prefetchSignature_ = 0;
+  /** Target spine already verified cached (or failed to build) under prefetchSkipSig_ — don't re-probe. */
+  int prefetchSkipSpine_ = -1;
+  uint32_t prefetchSkipSig_ = 0;
+  /** Foreground build wants page 0 pushed to the panel the moment it's laid out. */
+  bool earlyRenderArmed_ = false;
+  bool earlyRenderedThisBuild_ = false;
+
   int lastGoodSpineIndex_ = 0;
 
   int lastGoodPageNumber_ = 0;
@@ -359,6 +372,13 @@ class EpubActivity final : public ActivityWithSubactivity {
   void scheduleIdlePreparedPage();
   void runIdlePreparedPage();
   void runIdleSecondNextPage();
+  /** Cooperatively builds the next chapter's section cache while the reader is idle. */
+  void runIdleChapterPrefetch();
+  void resetChapterPrefetch();
+  /** Hash of every layout input loadSectionFile() verifies; used to invalidate prefetch on settings changes. */
+  uint32_t layoutParamsSignature(const ViewportInfo& info) const;
+  /** Section-build page callback: early-renders page 0 when a foreground build armed it. */
+  void onSectionPageBuilt(Page& page, uint16_t pageIndex);
   bool composePreparedForwardPage();
   bool presentPreparedForwardPage();
   bool finishPreparedPageGrayscale(const PreparedPage& prepared);

@@ -45,6 +45,7 @@ class Section {
   uint32_t pageCacheClock = 0;
   std::unique_ptr<ChapterHtmlSlimParser> incrementalParser_;
   std::unique_ptr<Epub::ItemStream> incrementalStream_;
+  std::function<void(Page&, uint16_t)> incrementalPageBuiltFn_;
   std::vector<uint32_t> incrementalLut_;
   std::string incrementalTempPath_;
   IncrementalBuildStatus incrementalBuildStatus_ = IncrementalBuildStatus::Idle;
@@ -155,11 +156,15 @@ class Section {
   bool beginIncrementalBuild(int fontId, int headerFontId, int maxFontId, float lineCompression, float wordSpacing,
                              bool extraParagraphSpacing, uint8_t paragraphAlignment, uint16_t viewportWidth,
                              uint16_t viewportHeight, bool hyphenationEnabled, bool respectCssParagraphIndent,
-                             bool bionicReadingEnabled, bool skipImages = false);
+                             bool bionicReadingEnabled, bool skipImages = false,
+                             const std::function<void(Page&, uint16_t)>& pageBuiltFn = nullptr);
   IncrementalBuildStatus stepIncrementalBuild(size_t maxInflatedBytes = 12 * 1024);
   void cancelIncrementalBuild();
   bool incrementalBuildActive() const { return incrementalParser_ != nullptr && incrementalStream_ != nullptr; }
   IncrementalBuildStatus incrementalBuildStatus() const { return incrementalBuildStatus_; }
+  /** Inflated chapter bytes fed to the parser so far / total (0 when unknown); valid while building. */
+  size_t incrementalBytesParsed() const { return incrementalBytesParsed_; }
+  size_t incrementalTotalBytes() const { return incrementalTotalBytes_; }
 
   /**
    * Loads a specific page from the section file.

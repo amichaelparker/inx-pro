@@ -473,7 +473,8 @@ bool Section::beginIncrementalBuild(
     const int fontId, const int headerFontId, const int maxFontId, const float lineCompression,
     const float wordSpacing, const bool extraParagraphSpacing, const uint8_t paragraphAlignment,
     const uint16_t viewportWidth, const uint16_t viewportHeight, const bool hyphenationEnabled,
-    const bool respectCssParagraphIndent, const bool bionicReadingEnabled, const bool skipImages) {
+    const bool respectCssParagraphIndent, const bool bionicReadingEnabled, const bool skipImages,
+    const std::function<void(Page&, uint16_t)>& pageBuiltFn) {
   if (!epub || incrementalBuildActive()) {
     return false;
   }
@@ -482,6 +483,7 @@ bool Section::beginIncrementalBuild(
   clearPageCache();
   pageOffsets.clear();
   pageCount = 0;
+  incrementalPageBuiltFn_ = pageBuiltFn;
   incrementalLut_.clear();
   incrementalBytesParsed_ = 0;
   incrementalTotalBytes_ = 0;
@@ -514,7 +516,9 @@ bool Section::beginIncrementalBuild(
       localPath, *epub, epub->getCachePath(), contentBasePath, renderer, fontId, headerFontId, maxFontId,
       lineCompression, wordSpacing, extraParagraphSpacing, paragraphAlignment, viewportWidth, viewportHeight,
       hyphenationEnabled, respectCssParagraphIndent, bionicReadingEnabled,
-      [this](std::unique_ptr<Page> page) { incrementalLut_.emplace_back(onPageComplete(std::move(page), nullptr)); });
+      [this](std::unique_ptr<Page> page) {
+        incrementalLut_.emplace_back(onPageComplete(std::move(page), incrementalPageBuiltFn_));
+      });
   incrementalParser_->internalPath = localPath;
 
   Hyphenator::setPreferredLanguage(epub->getLanguage());
@@ -624,6 +628,7 @@ Section::IncrementalBuildStatus Section::stepIncrementalBuild(const size_t maxIn
       incrementalTempPath_.clear();
       incrementalParser_.reset();
       incrementalStream_.reset();
+      incrementalPageBuiltFn_ = nullptr;
       incrementalLut_.clear();
       epub->flushImageMetadata();
       incrementalBuildStatus_ = IncrementalBuildStatus::Ready;
@@ -643,6 +648,7 @@ Section::IncrementalBuildStatus Section::stepIncrementalBuild(const size_t maxIn
 void Section::cancelIncrementalBuild() {
   incrementalParser_.reset();
   incrementalStream_.reset();
+  incrementalPageBuiltFn_ = nullptr;
   incrementalLut_.clear();
   if (file) {
     file.close();
